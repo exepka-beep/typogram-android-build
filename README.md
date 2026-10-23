@@ -10,7 +10,7 @@ GitHub Actions из форка `owpengram-android-client`. Клиент подк
 |---|---|
 | имя / пакет | `TypoGram` / `com.typogram.messenger` |
 | адрес сервера | `typogram.duckdns.org:2398` (домен, не IP) |
-| RSA-ключ сервера | `config/server-rsa-public.pem` (PKCS#1, fingerprint `0x2f8f…`) |
+| RSA-ключ сервера | `config/server-rsa-public.pem` (PKCS#1, fingerprint `0x2f91588dbb857afc`) |
 | иконки | родные, Telegram: брендовая графика из overlay удалена |
 | `server-info` | не используется — эндпоинта на VPS нет, ключ лежит в репозитории |
 

@@ -432,18 +432,29 @@ def main() -> int:
     if args.port is None:
         print("FAIL: нужен --port (в overlay стоит порт XTree Gram)")
         return 1
-    # Только числовой IPv4. Нативный слой Android (ConnectionSocket.cpp, ветка
-    # прямого подключения) зовёт inet_pton и имён не понимает: на домене сокет
-    # закрывается сразу, клиент переподключается по кругу и показывает вечную
-    # загрузку. Ошибка молчаливая, поэтому отказываемся здесь.
-    if not re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}", args.host or ""):
-        print("FAIL: --host %r не числовой IPv4." % args.host)
-        print("      Домен здесь не работает: inet_pton в нативном слое Android "
-              "имена не резолвит (ConnectionSocket.cpp), приложение уйдёт "
-              "в вечную загрузку.")
-        return 1
-    if any(int(octet) > 255 for octet in args.host.split(".")):
-        print("FAIL: --host %r — октет больше 255" % args.host)
+    # IPv4 либо имя хоста. Домен допустим только потому, что в overlay лежит
+    # пропатченный ConnectionSocket.cpp: он при провале inet_pton резолвит имя
+    # через gethostbyname. Без патча домен даёт молчаливую вечную загрузку,
+    # поэтому проверяем и сам адрес, и наличие патча в дереве сборки.
+    host = (args.host or "").strip()
+    if re.fullmatch(r"[0-9]{1,3}(\.[0-9]{1,3}){3}", host):
+        if any(int(octet) > 255 for octet in host.split(".")):
+            print("FAIL: --host %r — октет больше 255" % host)
+            return 1
+    elif re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?", host):
+        socket_cpp = root / "jni" / "tgnet" / "ConnectionSocket.cpp"
+        if not socket_cpp.is_file():
+            print("FAIL: --host %r — домен, но в дереве нет "
+                  "ConnectionSocket.cpp с резолвом имени" % host)
+            return 1
+        if "TypoGram: встроенный сервер задан доменом" not in socket_cpp.read_text(
+                encoding="utf-8", errors="replace"):
+            print("FAIL: --host %r — домен, но ConnectionSocket.cpp не пропатчен "
+                  "(нет gethostbyname после inet_pton)" % host)
+            return 1
+        print("host: домен %s, резолв через патч overlay" % host)
+    else:
+        print("FAIL: --host %r не похож ни на IPv4, ни на имя хоста" % host)
         return 1
     if not args.rsa_pem:
         # Без этого в APK остаётся ключ сервера XTree Gram, и клиент не сможет
