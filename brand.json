@@ -1,0 +1,83 @@
+{
+  "_comment": "Бренд TypoGram для Android-конвейера. Скрипты ребрендинга читают этот файл.",
+
+  "product": {
+    "name": "TypoGram",
+    "short_name": "TypoGram",
+    "username_prefix": "typo",
+    "app_scheme": "typogram",
+    "premium_name": "TypoGram Premium",
+    "stars_name": "TypoGram Stars",
+    "org_name": "TypoGram"
+  },
+
+  "replace": {
+    "_comment": "Overlay — это файлы XTree Gram, поэтому сначала снимаем его следы, потом добираем то, что он не тронул.",
+    "_android_overlay": "В Java применяется только группа XTree Gram: 'Telegram' там встречается в идентификаторах (org/telegram/...) и ссылках (t.me/Telegram).",
+    "rules": [
+      { "from": "XTree Gram", "to": "TypoGram", "skip_after": [], "skip_before": [] },
+      { "from": "Xtreegram", "to": "TypoGram", "skip_after": [], "skip_before": [] },
+      { "from": "XTREEGRAM", "to": "TYPOGRAM", "skip_after": [], "skip_before": [] },
+      { "from": "Telegram", "to": "TypoGram", "skip_after": [".org", ".ORG"], "skip_before": ["/"] },
+      { "from": "TELEGRAM", "to": "TYPOGRAM", "skip_after": [".ORG"], "skip_before": ["/"] }
+    ]
+  },
+
+  "android": {
+    "_keystore_password_comment": "Пароля здесь НЕТ: файл уезжает в публичный репозиторий. Пароль приходит секретом GitHub ANDROID_KEYSTORE_PASSWORD.",
+    "app_name": "TypoGram",
+    "app_name_beta": "TypoGram Beta",
+    "package": "com.typogram.messenger",
+    "namespace": "org.telegram.messenger.regular",
+    "flavor": "afat",
+    "keystore_file": "release.keystore",
+    "keystore_alias": "shapitogramkey",
+    "keystore_type": "PKCS12",
+    "keystore_keyalg": "RSA",
+    "keystore_keysize": 4096,
+    "keystore_validity_days": 10950,
+    "keystore_cert_sha256": "4A:AB:1A:40:0F:1E:AB:E5:4D:B1:AB:B1:41:BD:9F:C0:7D:68:1F:EC:54:71:5E:1B:1D:D5:16:B1:8F:DE:F3:6B"
+  },
+
+  "ios": {
+    "app_name": "TypoGram",
+    "bundle_id": "com.typogram.messenger"
+  },
+
+  "desktop": {
+    "app_name": "TypoGram Desktop",
+    "short_app_name": "TypoGram",
+    "application_name": "TypoGramDesktop",
+    "company_name": "TypoGram",
+    "bundle_id": "com.typogram.desktop",
+    "linux_app_id": "com.typogram.desktop"
+  },
+
+  "pc_client": {
+    "distribution": "prebuilt",
+    "source_releases": "https://github.com/owpengram/owpengram-desktop-client/releases",
+    "exe_name": "TypoGram.exe",
+    "server_name": "TypoGram",
+    "server_description": "Self-hosted TypoGram server.",
+    "server_icon_env": "TELESRV_OWPENGRAM_SERVER_ICON"
+  },
+
+  "server": {
+    "domain": "typogram.duckdns.org",
+    "base_url": "https://typogram.duckdns.org",
+    "web_base_url": "https://typogram.duckdns.org",
+    "advertise_ip": "177.3.222.2",
+    "public_listen_host": "127.0.0.1",
+    "server_port": 2398,
+    "dc_id": 2,
+    "default_country_code": "RU",
+    "websocket_allowed_origins": "https://typogram.duckdns.org",
+    "image_prefix": "ghcr.io/iamxvbaba/gramsrv",
+    "image_tag": "main"
+  },
+
+  "telegram_bot": {
+    "username": "typogramsbot",
+    "token": ""
+  }
+}

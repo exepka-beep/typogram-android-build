@@ -1,0 +1,997 @@
+package org.telegram.owpengram;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+import android.text.TextUtils;
+
+import android.graphics.Bitmap;
+
+import org.telegram.messenger.ApplicationLoader;
+import org.telegram.messenger.FileLog;
+import org.telegram.messenger.MessagesController;
+import org.telegram.messenger.UserConfig;
+import org.telegram.tgnet.ConnectionsManager;
+
+import org.telegram.messenger.AndroidUtilities;
+
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.security.MessageDigest;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+public class OwpengramServers {
+
+    private static final String PREFS_NAME = "owpengram_servers";
+    private static final String KEY_CUSTOM_SERVERS = "custom_servers";
+    private static final String KEY_ACCOUNT_SERVER = "account_server_";
+    // Built-in servers are rebuilt from compile-time constants by
+    // owpengramServer()/telegramServer(), so unlike custom ones they have no
+    // KEY_CUSTOM_SERVERS entry to write a refreshed name/description/logo
+    // back into. This holds those cosmetic overrides, keyed by server id.
+    private static final String KEY_BUILTIN_IDENTITY = "builtin_identity";
+
+    public static final String ID_OWPENGRAM = "owpengram";
+    public static final String ID_TELEGRAM  = "telegram";
+
+    // Fired whenever the stored custom-server list changes (add/update/remove,
+    // from ANY code path -- including one triggered from outside the
+    // currently-visible UI, e.g. an owpg://addserver link opened while
+    // ServerSelectFragment already happens to be showing). Any UI presenting
+    // that list should register here instead of only refreshing from its own
+    // local "just saved" callback, or it goes stale until the user leaves the
+    // fragment and comes back. Always delivered on the UI thread.
+    private static final CopyOnWriteArrayList<Runnable> customServersChangedListeners = new CopyOnWriteArrayList<>();
+
+    public static void addCustomServersChangedListener(Runnable listener) {
+        customServersChangedListeners.add(listener);
+    }
+
+    public static void removeCustomServersChangedListener(Runnable listener) {
+        customServersChangedListeners.remove(listener);
+    }
+
+    private static final String DEFAULT_HOST = "2.27.200.203";
+    private static final int    DEFAULT_PORT = 2398;
+
+    // OwpenGram's own production server RSA key.
+    static final String OWPENGRAM_RSA_KEY =
+        "-----BEGIN RSA PUBLIC KEY-----\n" +
+        "MIIBCgKCAQEAxF//0M0+/5PzgdNagTX+J+dJgr75ZCTuiG8i4x7YwmJF+jiOGCjm\n" +
+        "7X7BLCaMc1+hOZYDL3+Gvle/AKykW1qouaCJMVx/H+2l8LFXLelZ2PLawTb8A7Bl\n" +
+        "TqWzL3db5BugMNWziL9TuhR8In1bwKY07QVpR9in5zjAsAGLBk+mGt0DnVyMf1Xo\n" +
+        "p2lLCFNmm0F4ykcAeaLCCIPbGWddliLY8xEEhI4GO2l1U3kZMwIOdOnAGJFtgUAo\n" +
+        "Te+FHR6F1s9adCVZB1teL/hf9R+WmekJwygVz0MYEH7y6U49T45+/W7OF6X6g0W0\n" +
+        "j1uSSrsY4qN7twxbTad9zdGZ7ys+9v+PuQIDAQAB\n" +
+        "-----END RSA PUBLIC KEY-----";
+    // fingerprint == 0 -> native layer derives it from the PEM (see ConnectionsManager::applyServerConfig).
+    static final long OWPENGRAM_RSA_FINGERPRINT = 0;
+
+    // Official Telegram production RSA key (restored from original Android source)
+    static final String TELEGRAM_RSA_KEY =
+        "-----BEGIN RSA PUBLIC KEY-----\n" +
+        "MIIBCgKCAQEA6LszBcC1LGzyr992NzE0ieY+BSaOW622Aa9Bd4ZHLl+TuFQ4lo4g\n" +
+        "5nKaMBwK/BIb9xUfg0Q29/2mgIR6Zr9krM7HjuIcCzFvDtr+L0GQjae9H0pRB2OO\n" +
+        "62cECs5HKhT5DZ98K33vmWiLowc621dQuwKWSQKjWf50XYFw42h21P2KXUGyp2y/\n" +
+        "+aEyZ+uVgLLQbRA1dEjSDZ2iGRy12Mk5gpYc397aYp438fsJoHIgJ2lgMv5h7WY9\n" +
+        "t6N/byY9Nw9p21Og3AoXSL2q/2IJ1WRUhebgAdGVMlV1fkuOQoEzR7EdpqtQD9Cs\n" +
+        "5+bfo3Nhmcyvk5ftB0WkJ9z6bNZ7yxrP8wIDAQAB\n" +
+        "-----END RSA PUBLIC KEY-----";
+    static final long TELEGRAM_RSA_FINGERPRINT = 0xd09d1d85de64fd85L;
+
+    // --- Built-in servers ---
+
+    public static OwpengramServer owpengramServer() {
+        OwpengramServer s = new OwpengramServer();
+        s.id                 = ID_OWPENGRAM;
+        s.name               = "XTree Gram";
+        s.description        = "Self-hosted XTree Gram server.";
+        s.host               = DEFAULT_HOST;
+        s.port               = DEFAULT_PORT;
+        s.isOfficial         = true;
+        s.isTelegram         = false;
+        s.multiDc            = false;
+        s.mainDcId           = 2;
+        s.rsaPublicKey       = OWPENGRAM_RSA_KEY;
+        s.rsaKeyFingerprint  = OWPENGRAM_RSA_FINGERPRINT;
+        // Whatever the operator has since set on the server itself wins over
+        // the shipped defaults -- see refreshServersInfo(). Only name,
+        // description and logo: host/port/key above stay compiled-in.
+        applyBuiltinIdentity(s);
+        return s;
+    }
+
+    public static OwpengramServer telegramServer() {
+        OwpengramServer s = new OwpengramServer();
+        s.id                 = ID_TELEGRAM;
+        s.name               = "Telegram";
+        s.description        = "Official Telegram cloud. Sign in with your Telegram account.";
+        s.host               = "149.154.167.51";
+        s.port               = 443;
+        s.isOfficial         = true;
+        s.isTelegram         = true;
+        s.multiDc            = true;
+        s.mainDcId           = 2;
+        s.rsaPublicKey       = TELEGRAM_RSA_KEY;
+        s.rsaKeyFingerprint  = TELEGRAM_RSA_FINGERPRINT;
+        return s;
+    }
+
+    // --- Server list ---
+
+    public static List<OwpengramServer> listServers() {
+        List<OwpengramServer> result = new ArrayList<>();
+        // Встроенный сервер только один — XTree Gram. Список серверов Telegram
+        // из пикера убран: приложение работает через наш сервер, а не через чужие.
+        result.add(owpengramServer());
+        result.addAll(loadCustomServers());
+        return result;
+    }
+
+    public static OwpengramServer getServerById(String id) {
+        if (id == null) return null;
+        for (OwpengramServer s : listServers()) {
+            if (id.equals(s.id)) return s;
+        }
+        return null;
+    }
+
+    // --- Custom server persistence ---
+
+    public static List<OwpengramServer> loadCustomServers() {
+        List<OwpengramServer> result = new ArrayList<>();
+        try {
+            String json = getPrefs().getString(KEY_CUSTOM_SERVERS, "[]");
+            JSONArray array = new JSONArray(json);
+            for (int i = 0; i < array.length(); i++) {
+                result.add(OwpengramServer.fromJson(array.getJSONObject(i)));
+            }
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+        return result;
+    }
+
+    private static void saveCustomServers(List<OwpengramServer> customs) {
+        try {
+            JSONArray array = new JSONArray();
+            for (OwpengramServer s : customs) {
+                array.put(s.toJson());
+            }
+            getPrefs().edit().putString(KEY_CUSTOM_SERVERS, array.toString()).apply();
+        } catch (Exception e) {
+            FileLog.e(e);
+            return;
+        }
+        // Single choke point every addCustomServer/updateCustomServer/
+        // removeCustomServer writes through, so notifying here (rather than
+        // separately in each of those three) can never drift out of sync
+        // with a future fourth mutator.
+        AndroidUtilities.runOnUIThread(() -> {
+            for (Runnable listener : customServersChangedListeners) {
+                listener.run();
+            }
+        });
+    }
+
+    public static void addCustomServer(OwpengramServer server) {
+        if (server.id == null || server.id.isEmpty()) {
+            server.id = UUID.randomUUID().toString();
+        }
+        server.isOfficial = false;
+        List<OwpengramServer> customs = loadCustomServers();
+        customs.add(server);
+        saveCustomServers(customs);
+    }
+
+    public static void updateCustomServer(OwpengramServer updated) {
+        List<OwpengramServer> customs = loadCustomServers();
+        for (int i = 0; i < customs.size(); i++) {
+            if (updated.id.equals(customs.get(i).id)) {
+                customs.set(i, updated);
+                saveCustomServers(customs);
+                return;
+            }
+        }
+    }
+
+    public static void removeCustomServer(String id) {
+        List<OwpengramServer> customs = loadCustomServers();
+        for (int i = 0; i < customs.size(); i++) {
+            if (id.equals(customs.get(i).id)) {
+                customs.remove(i);
+                saveCustomServers(customs);
+                return;
+            }
+        }
+    }
+
+    // --- Account - server binding ---
+
+    public static String getServerIdForAccount(int accountNum) {
+        return getPrefs().getString(KEY_ACCOUNT_SERVER + accountNum, null);
+    }
+
+    public static void setServerForAccount(String serverId, int accountNum) {
+        getPrefs().edit().putString(KEY_ACCOUNT_SERVER + accountNum, serverId).apply();
+    }
+
+    public static OwpengramServer getServerForAccount(int accountNum) {
+        return getServerById(getServerIdForAccount(accountNum));
+    }
+
+    public static boolean hasServerForAccount(int accountNum) {
+        return getServerIdForAccount(accountNum) != null;
+    }
+
+    /**
+     * Clears the account-slot -> server-id mapping. Must be called on logout:
+     * account slots are freed and reused by whatever account logs in next
+     * (see UserConfig / ProfileActivity's "Add another account" free-slot
+     * scan), but this mapping is keyed by slot number, not by user identity.
+     * Without clearing it here, a newly-activated account inheriting a
+     * previously-used slot would silently inherit the PREVIOUS occupant's
+     * server assignment (wrong category in the account list, wrong DC/RSA
+     * key applied) until the user happens to pick a server again.
+     */
+    public static void clearServerForAccount(int accountNum) {
+        getPrefs().edit().remove(KEY_ACCOUNT_SERVER + accountNum).apply();
+    }
+
+    /**
+     * Stable key for grouping per-server local device state (currently: recent/frequently-used
+     * emoji, see Emoji.java) by backend rather than by device. Two different custom servers do
+     * NOT share a document-id namespace — a custom-emoji document id cached while using one
+     * never resolves on another (or on official Telegram), so state keyed only by device would
+     * leak cross-server ids into every account's UI, permanently unresolvable there (see
+     * AnimatedEmojiDrawable.EmojiDocumentFetcher — a not-found custom emoji has no negative
+     * cache/timeout, it just stays broken forever). Official Telegram, and anything we can't
+     * identify a server for, get "" (the original, unsuffixed storage keys) so existing
+     * installs' state is preserved unchanged. Host, not server id, is the actual identity that
+     * matters here: the same physical backend added twice under different local ids should
+     * still share one scope.
+     */
+    public static String serverScopeKeyForAccount(int accountNum) {
+        OwpengramServer s = getServerForAccount(accountNum);
+        if (s == null || s.isTelegram || TextUtils.isEmpty(s.host)) {
+            return "";
+        }
+        return s.host.toLowerCase(java.util.Locale.US);
+    }
+
+    /**
+     * Whether the account's current server exposes Telegram Premium / Stars /
+     * Business features. Telegram always does. Any other (custom
+     * self-hosted, e.g. gramsrv) server is trusted based on its own appConfig
+     * contract — help.getAppConfig `premium_purchase_blocked` / `stars_purchase_blocked`
+     * (MessagesController.premiumLocked / starsLocked, refreshed on every appConfig
+     * fetch) — the same signal the desktop client relies on via session->premiumPossible(),
+     * which has no separate per-server allowlist. A server that doesn't implement these
+     * features server-side is expected to send the blocked flags (as the old
+     * owpengram-server did); one that does (gramsrv) is not unconditionally hidden here
+     * just for not being a hardcoded preset.
+     */
+    public static boolean serverSupportsPremium(int accountNum) {
+        OwpengramServer s = getServerForAccount(accountNum);
+        if (s == null) {
+            return false;
+        }
+        if (s.isTelegram) {
+            return true;
+        }
+        MessagesController mc = MessagesController.getInstance(accountNum);
+        return !mc.premiumLocked || !mc.starsLocked;
+    }
+
+    /**
+     * Whether the account's current server is the official Telegram network.
+     * Used to hide Telegram-specific help entries (Ask a Question, Telegram FAQ /
+     * Features, Privacy Policy) on OwpenGram and other servers, where they don't apply.
+     */
+    public static boolean serverIsOfficialTelegram(int accountNum) {
+        OwpengramServer s = getServerForAccount(accountNum);
+        return s != null && s.isTelegram;
+    }
+
+    /**
+     * Whether the account's current server uses email as the account identity
+     * instead of a real phone number (help.getAppConfig `email_signup_enabled`,
+     * MessagesController.emailSignupEnabled, refreshed on every appConfig
+     * fetch — same mechanism as serverSupportsPremium above). Such a server has
+     * no real SMS delivery, so changing to an arbitrary phone number is
+     * server-side forbidden; used to pre-empt that with a clear client-side
+     * message instead of a confusing RPC error.
+     */
+    public static boolean serverHasEmailSignup(int accountNum) {
+        return MessagesController.getInstance(accountNum).emailSignupEnabled;
+    }
+
+    /**
+     * True when two account slots target the same server. Used so the duplicate
+     * login check (same phone / same user id) only triggers within one server —
+     * the same phone number on a different server is a different account.
+     * Matches by server id, or by resolved endpoint (host:port + Telegram flag)
+     * so two profiles pointing at the same machine are still treated as one.
+     */
+    public static boolean sameAccountServer(int accountA, int accountB) {
+        String idA = getServerIdForAccount(accountA);
+        String idB = getServerIdForAccount(accountB);
+        if (java.util.Objects.equals(idA, idB)) {
+            return true;
+        }
+        OwpengramServer sa = getServerById(idA);
+        OwpengramServer sb = getServerById(idB);
+        if (sa == null || sb == null) {
+            return false;
+        }
+        return sa.isTelegram == sb.isTelegram
+                && sa.port == sb.port
+                && sa.host != null && sa.host.equals(sb.host);
+    }
+
+    // --- DC application ---
+
+    /**
+     * Applies the selected server to the given account, atomically on the network
+     * thread. Mirrors desktop ApplyServerToDcOptions + RestoreServerToAccount:
+     *   - Telegram:       restore real Telegram DC 1-5, unlock, Telegram RSA key
+     *   - Single-server:  map DC 1-5 all to one host:port, lock, server RSA key
+     *
+     * resetKeys=true clears auth keys (user picked a NEW server -> force re-handshake);
+     * resetKeys=false keeps them (startup restore -> reuse the existing session).
+     */
+    public static void applyServerToAccount(OwpengramServer server, int accountNum) {
+        applyServerToAccount(server, accountNum, true);
+    }
+
+    public static void applyServerToAccount(OwpengramServer server, int accountNum, boolean resetKeys) {
+        if (server == null) return;
+        final String key;
+        final long fingerprint;
+        if (server.isTelegram) {
+            key = TELEGRAM_RSA_KEY;
+            fingerprint = TELEGRAM_RSA_FINGERPRINT;
+        } else if (server.rsaPublicKey != null && !server.rsaPublicKey.isEmpty()) {
+            // Custom server with its own RSA key. Pass fingerprint 0 so the native
+            // layer derives it from the PEM (we can't compute it in Java).
+            key = server.rsaPublicKey;
+            fingerprint = (server.rsaKeyFingerprint != 0) ? server.rsaKeyFingerprint : 0;
+        } else {
+            // No key provided -> shared default owpengram key (fingerprint known).
+            key = OWPENGRAM_RSA_KEY;
+            fingerprint = OWPENGRAM_RSA_FINGERPRINT;
+        }
+        int mainDc = server.mainDcId > 0
+                ? server.mainDcId
+                : (server.isTelegram ? 2 : 1);
+        ConnectionsManager.native_applyServerConfig(
+                accountNum,
+                server.host,
+                server.port,
+                server.isTelegram,
+                mainDc,
+                key,
+                fingerprint,
+                resetKeys);
+    }
+
+    /**
+     * Called from ApplicationLoader after each account's ConnectionsManager is
+     * initialized, to restore the previously selected server config. Does NOT
+     * reset auth keys so an already-authorized session keeps working.
+     */
+    public static void applyStoredServerToAccount(int accountNum) {
+        OwpengramServer server = getServerForAccount(accountNum);
+        if (server != null) {
+            applyServerToAccount(server, accountNum, false);
+        }
+    }
+
+    /**
+     * Xtreegram: применяет встроенный сервер XTree Gram к слоту аккаунта и поднимает сеть —
+     * без экрана выбора сервера (ServerSelectFragment). Сборка Xtreegram всегда работает через
+     * наш сервер, поэтому и первый запуск, и добавление аккаунта идут сразу на ввод номера.
+     *
+     * resetKeys=true намеренно: слот логинится заново, сохранённая сессия недействительна.
+     * Без этого шага нативный слой остался бы на дефолтных DC Telegram и логин не прошёл бы.
+     */
+    public static void applyDefaultServerForAccount(int accountNum) {
+        OwpengramServer server = owpengramServer();
+        setServerForAccount(server.id, accountNum);
+        applyServerToAccount(server, accountNum, true);
+        ConnectionsManager.getInstance(accountNum).resumeNetworkMaybe();
+    }
+
+    // --- Helpers ---
+
+    private static SharedPreferences getPrefs() {
+        return ApplicationLoader.applicationContext
+                .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    /**
+     * Every activated account whose current server resolves to serverId --
+     * used to warn before deleting a custom server that doing so will orphan
+     * those accounts (see ServerInfoFragment.confirmDelete), since nothing
+     * else keeps an account pointed at a server that no longer exists in the
+     * list from silently breaking.
+     */
+    public static List<Integer> accountsUsingServer(String serverId) {
+        List<Integer> result = new ArrayList<>();
+        if (TextUtils.isEmpty(serverId)) {
+            return result;
+        }
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            if (UserConfig.getInstance(a).isClientActivated()
+                    && serverId.equals(getServerIdForAccount(a))) {
+                result.add(a);
+            }
+        }
+        return result;
+    }
+
+    /** Returns true when at least one active account uses a Telegram-official server. */
+    public static boolean anyAccountIsTelegram() {
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            if (UserConfig.getInstance(a).isClientActivated()) {
+                OwpengramServer s = getServerForAccount(a);
+                if (s != null && s.isTelegram) return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Self-hosted invite/username link routing (owpg scheme). Finds an activated
+     * account that owns the given link host, i.e. whose me_url_prefix host
+     * (MessagesController.linkPrefix) equals {@code host} AND whose server explicitly
+     * advertises owpengram=true in help.getAppConfig (so the official Telegram network
+     * and other forks on a shared host are excluded). Prefers the currently
+     * selected account when it matches. Returns the account index, or -1 if none.
+     * Mirrors the desktop OwpengramHostForUrl / OwpengramAccountHost.
+     */
+    public static int findOwpengramAccountForHost(String host) {
+        if (TextUtils.isEmpty(host)) {
+            return -1;
+        }
+        host = host.toLowerCase();
+        // Prefer the active account so a link is opened on the account the user is on.
+        int selected = UserConfig.selectedAccount;
+        if (accountOwnsHost(selected, host)) {
+            return selected;
+        }
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            if (a != selected && accountOwnsHost(a, host)) {
+                return a;
+            }
+        }
+        return -1;
+    }
+
+    private static boolean accountOwnsHost(int accountNum, String host) {
+        if (!UserConfig.getInstance(accountNum).isClientActivated()) {
+            return false;
+        }
+        // owpg links never target the official Telegram network (t.me handling applies there).
+        if (serverIsOfficialTelegram(accountNum)) {
+            return false;
+        }
+        MessagesController controller = MessagesController.getInstance(accountNum);
+        // Primary: the host matches this account's me_url_prefix (link prefix).
+        String prefix = controller.linkPrefix;
+        if (prefix != null && host.equalsIgnoreCase(prefix)) {
+            return true;
+        }
+        // Fallback: the host matches the account's actual server endpoint host. Covers
+        // owpg://<server-ip-or-domain>/... even before me_url_prefix / the appConfig
+        // owpengram marker have been refetched (e.g. after the admin changed the prefix).
+        OwpengramServer server = getServerForAccount(accountNum);
+        if (server != null && server.host != null && host.equalsIgnoreCase(server.host)) {
+            return true;
+        }
+        return false;
+    }
+
+    /** Returns the first activated account whose server is isTelegram, or -1. */
+    public static int firstTelegramAccount() {
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            if (UserConfig.getInstance(a).isClientActivated()) {
+                OwpengramServer s = getServerForAccount(a);
+                if (s != null && s.isTelegram) return a;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Display name of the server an account is on, or null if unknown. Used for
+     * the main app header so it shows the current server instead of "Telegram".
+     */
+    public static String serverNameForAccount(int accountNum) {
+        OwpengramServer s = getServerForAccount(accountNum);
+        return (s != null) ? s.name : null;
+    }
+
+    // --- Account limits (mirrors desktop: premium cap is Telegram-only) ---
+
+    /** First unused account slot (any server), or -1 if all slots are taken. */
+    public static int firstFreeAccountSlot() {
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            if (!UserConfig.getInstance(a).isClientActivated()) {
+                return a;
+            }
+        }
+        return -1;
+    }
+
+    /** Number of activated accounts on a Telegram-official server. */
+    public static int countTelegramAccounts() {
+        int n = 0;
+        for (int a = 0; a < UserConfig.MAX_ACCOUNT_COUNT; a++) {
+            if (UserConfig.getInstance(a).isClientActivated()) {
+                OwpengramServer s = getServerForAccount(a);
+                if (s != null && s.isTelegram) n++;
+            }
+        }
+        return n;
+    }
+
+    // Telegram-official account caps, mirroring the desktop client:
+    //   kMaxAccounts = 3 (free), kPremiumMaxAccounts = 6 (with premium).
+    private static final int TELEGRAM_FREE_LIMIT = 3;
+    private static final int TELEGRAM_PREMIUM_LIMIT = 6;
+
+    /**
+     * Telegram-account cap (premium raises it from 3 to 6). Only Telegram accounts
+     * count toward this; custom/self-hosted accounts are limited solely by the hard
+     * total slot count (MAX_ACCOUNT_COUNT).
+     */
+    public static int telegramAccountLimit() {
+        int limit = UserConfig.hasPremiumOnAccounts()
+                ? TELEGRAM_PREMIUM_LIMIT
+                : TELEGRAM_FREE_LIMIT;
+        return Math.min(limit, UserConfig.MAX_ACCOUNT_COUNT);
+    }
+
+    /** True if another Telegram account can still be added under the premium cap. */
+    public static boolean canAddTelegramAccount() {
+        return countTelegramAccounts() < telegramAccountLimit();
+    }
+
+    public static class ServerInfoFetchResult {
+        public final String rsaPublicKeyPem;
+        public final int dcId;
+        // name/description/hasIcon are admin-edited on the server (Server
+        // Settings' identity section) and optional -- empty/false means the
+        // operator hasn't set them, not that the server failed to answer.
+        public final String name;
+        public final String description;
+        public final boolean hasIcon;
+
+        public ServerInfoFetchResult(String rsaPublicKeyPem, int dcId, String name, String description, boolean hasIcon) {
+            this.rsaPublicKeyPem = rsaPublicKeyPem;
+            this.dcId = dcId;
+            this.name = name;
+            this.description = description;
+            this.hasIcon = hasIcon;
+        }
+    }
+
+    /**
+     * Fetches a server's RSA public key, home DC id, and identity
+     * (name/description/icon presence) from its well-known same-port HTTP
+     * endpoint (GET host:port/owpengram/server-info), so "Add Server" can be
+     * filled in from just host:port instead of manual PEM copy-paste +
+     * guessing the DC id. callback receives the result on success, or null
+     * on any failure (offline, unsupported server, malformed response) --
+     * always on the UI thread (AsyncTask#onPostExecute).
+     */
+    public static org.telegram.ui.web.HttpGetTask fetchServerInfo(String host, int port, org.telegram.messenger.Utilities.Callback<ServerInfoFetchResult> callback) {
+        if (TextUtils.isEmpty(host) || port <= 0) {
+            callback.run(null);
+            return null;
+        }
+        String url = "http://" + host + ":" + port + "/owpengram/server-info";
+        org.telegram.ui.web.HttpGetTask task = new org.telegram.ui.web.HttpGetTask(body -> {
+            if (body == null) {
+                callback.run(null);
+                return;
+            }
+            try {
+                JSONObject obj = new JSONObject(body);
+                String pem = obj.optString("rsa_public_key_pem", "");
+                int dcId = obj.optInt("dc_id", 0);
+                String name = obj.optString("name", "");
+                String description = obj.optString("description", "");
+                boolean hasIcon = obj.optBoolean("has_icon", false);
+                callback.run(pem.isEmpty() ? null : new ServerInfoFetchResult(pem, dcId, name, description, hasIcon));
+            } catch (Exception e) {
+                callback.run(null);
+            }
+        });
+        // executeOnExecutor(THREAD_POOL_EXECUTOR, ...) instead of plain execute():
+        // AsyncTask#execute() queues onto one shared app-wide SERIAL_EXECUTOR, so a
+        // still-in-flight request (e.g. against an address the user hasn't finished
+        // typing yet) would otherwise block every later request -- including this
+        // very call's own retry with the corrected address -- until it finishes.
+        task.executeOnExecutor(android.os.AsyncTask.THREAD_POOL_EXECUTOR, url);
+        return task;
+    }
+
+    private static final String SERVER_LOGOS_DIR = "owpengram_server_logos";
+
+    /**
+     * Fetches a server's icon (GET host:port/owpengram/server-icon) -- only
+     * worth calling when a prior fetchServerInfo answered with hasIcon=true.
+     * callback receives the decoded bitmap on success, or null on any
+     * failure -- always on the UI thread (AsyncTask#onPostExecute).
+     */
+    public static org.telegram.ui.web.HttpGetBitmapTask fetchServerIcon(String host, int port, org.telegram.messenger.Utilities.Callback<Bitmap> callback) {
+        if (TextUtils.isEmpty(host) || port <= 0) {
+            callback.run(null);
+            return null;
+        }
+        String url = "http://" + host + ":" + port + "/owpengram/server-icon";
+        org.telegram.ui.web.HttpGetBitmapTask task = new org.telegram.ui.web.HttpGetBitmapTask(callback::run);
+        task.executeOnExecutor(android.os.AsyncTask.THREAD_POOL_EXECUTOR, url);
+        return task;
+    }
+
+    /**
+     * Persists a server icon bitmap -- auto-fetched from the server or
+     * picked locally by the user (see AddServerFragment.pickIcon /
+     * applyIconBitmap) -- under the app's own files directory (mirrors the
+     * desktop client's owpengram_server_logos/ convention) and returns the
+     * absolute path to store as OwpengramServer.logoPath. Unlike a cache-dir
+     * temp file, this survives Android reclaiming cache space, since it's
+     * the server's permanent logo once saved.
+     */
+    public static String saveFetchedIcon(Bitmap bitmap) {
+        if (bitmap == null) {
+            return null;
+        }
+        File dir = new File(ApplicationLoader.applicationContext.getFilesDir(), SERVER_LOGOS_DIR);
+        if (!dir.exists() && !dir.mkdirs()) {
+            FileLog.e("OwpengramServers: failed to create " + dir);
+            return null;
+        }
+        File file = new File(dir, "fetched_" + System.currentTimeMillis() + ".png");
+        try (FileOutputStream out = new FileOutputStream(file)) {
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, out);
+        } catch (Exception e) {
+            FileLog.e(e);
+            return null;
+        }
+        return file.getAbsolutePath();
+    }
+
+    // --- Live server identity (name / description / icon) ---
+
+    // Plain statics rather than atomics: fetchServerInfo/fetchServerIcon both
+    // answer on the UI thread (AsyncTask#onPostExecute), so every read and
+    // write below happens there too.
+    private static boolean refreshRunning = false;
+    private static int refreshRemaining = 0;
+
+    /**
+     * Re-reads the admin-edited identity (name/description/icon) of every
+     * server that serves /owpengram/server-info and stores it, so a logo or
+     * title the operator changed shows up without the user having to open
+     * Edit Server and re-fetch by hand. Call it when a server list becomes
+     * visible.
+     *
+     * Deliberately cosmetic-only: host, port, RSA key, DC id and id are NEVER
+     * touched by this. That endpoint is plain HTTP, so anything able to MITM
+     * it could otherwise redirect the connection or swap the key the
+     * handshake is verified against; a wrong name or icon is merely wrong,
+     * not dangerous.
+     *
+     * The Telegram server is skipped -- it is not an OwpenGram backend and
+     * has no such endpoint. Fire-and-forget: one round at a time, and any
+     * failure silently keeps the stored values.
+     */
+    public static void refreshServersInfo() {
+        if (refreshRunning) {
+            return;
+        }
+        List<OwpengramServer> targets = new ArrayList<>();
+        for (OwpengramServer s : listServers()) {
+            if (s.isTelegram || TextUtils.isEmpty(s.host) || s.port <= 0) {
+                continue;
+            }
+            targets.add(s);
+        }
+        if (targets.isEmpty()) {
+            return;
+        }
+        refreshRunning = true;
+        refreshRemaining = targets.size();
+        for (OwpengramServer target : targets) {
+            final OwpengramServer server = target;
+            fetchServerInfo(server.host, server.port, result -> {
+                if (result == null) {
+                    refreshFinished();
+                    return;
+                }
+                // result.rsaPublicKeyPem and result.dcId are deliberately
+                // ignored -- see the security note above.
+                final String name = result.name;
+                final String description = result.description;
+                if (!result.hasIcon) {
+                    // Explicit "no icon" -- clears one previously fetched from
+                    // this server, so deleting it there deletes it here.
+                    applyFetchedIdentity(server, name, description, null, false);
+                    refreshFinished();
+                    return;
+                }
+                fetchServerIcon(server.host, server.port, bitmap -> {
+                    // hasIcon stays true even when the download failed and the
+                    // path is null: the server does have an icon, this round
+                    // just did not get it, so keep the stored one.
+                    applyFetchedIdentity(
+                            server,
+                            name,
+                            description,
+                            saveFetchedIconStable(server.id, bitmap),
+                            true);
+                    refreshFinished();
+                });
+            });
+        }
+    }
+
+    // Decremented on every outcome including failure, so one unreachable
+    // server can't wedge the flag and block all later refreshes.
+    private static void refreshFinished() {
+        if (--refreshRemaining <= 0) {
+            refreshRunning = false;
+        }
+    }
+
+    /**
+     * Stores the cosmetic fields a server just reported about itself. An
+     * empty name/description/logoPath means the operator has not set that
+     * field, so the existing value is kept rather than blanked.
+     *
+     * Returns without writing when nothing actually differs. That is load
+     * bearing, not an optimisation: writing notifies the custom-servers
+     * listeners and the visible list rebuilds on that, so an unconditional
+     * write would repaint the screen on every single refresh.
+     */
+    private static void applyFetchedIdentity(
+            OwpengramServer server,
+            String name,
+            String description,
+            String logoPath,
+            boolean hasIcon) {
+        String supersededLogo = null;
+        boolean changed = false;
+
+        if (server.isOfficial) {
+            JSONObject stored = readBuiltinIdentityRoot().optJSONObject(server.id);
+            String currentName = stored != null ? stored.optString("name", "") : "";
+            String currentDescription = stored != null ? stored.optString("description", "") : "";
+            String currentLogo = stored != null ? stored.optString("logoPath", "") : "";
+            String nextName = currentName;
+            String nextDescription = currentDescription;
+            String nextLogo = currentLogo;
+            if (!TextUtils.isEmpty(name) && !name.equals(currentName)) {
+                nextName = name;
+                changed = true;
+            }
+            if (!TextUtils.isEmpty(description) && !description.equals(currentDescription)) {
+                nextDescription = description;
+                changed = true;
+            }
+            if (!TextUtils.isEmpty(logoPath)) {
+                if (!logoPath.equals(currentLogo)) {
+                    nextLogo = logoPath;
+                    changed = true;
+                }
+            } else if (!hasIcon && isFetchedServerLogo(server.id, currentLogo)) {
+                // Emptied here means the key is dropped on write, so
+                // owpengramServer() falls back to its compiled-in logo.
+                // Gated on !hasIcon because an empty path also happens when
+                // the server HAS an icon but this round failed to fetch it.
+                nextLogo = "";
+                changed = true;
+            }
+            if (!changed) {
+                return;
+            }
+            // Only when the stored path actually moved: a round that changed
+            // just the name, while an icon fetch happened to fail, must not
+            // delete the logo file the entry still points at.
+            if (!TextUtils.equals(nextLogo, currentLogo)) {
+                supersededLogo = currentLogo;
+            }
+            writeBuiltinIdentity(server.id, nextName, nextDescription, nextLogo);
+            AndroidUtilities.runOnUIThread(() -> {
+                for (Runnable listener : customServersChangedListeners) {
+                    listener.run();
+                }
+            });
+        } else {
+            if (!TextUtils.isEmpty(name) && !name.equals(server.name)) {
+                server.name = name;
+                changed = true;
+            }
+            if (!TextUtils.isEmpty(description) && !description.equals(server.description)) {
+                server.description = description;
+                changed = true;
+            }
+            if (!TextUtils.isEmpty(logoPath)) {
+                if (!logoPath.equals(server.logoPath)) {
+                    supersededLogo = server.logoPath;
+                    server.logoPath = logoPath;
+                    changed = true;
+                }
+            } else if (!hasIcon && isFetchedServerLogo(server.id, server.logoPath)) {
+                // Cleared rather than left stale, so the row falls back to the
+                // coloured letter avatar like a server that never had a logo.
+                // Gated on !hasIcon because an empty path also happens when
+                // the server HAS an icon but this round failed to fetch it.
+                supersededLogo = server.logoPath;
+                server.logoPath = "";
+                changed = true;
+            }
+            if (!changed) {
+                return;
+            }
+            // Only the three fields above were touched; host/port/RSA/id ride
+            // along unchanged from the same stored object. Notifies listeners.
+            updateCustomServer(server);
+        }
+
+        // Set only where the stored path actually changed above, so this can
+        // never delete a file an entry still points at. deleteServerLogoFile
+        // additionally refuses anything outside our own logos directory.
+        if (!TextUtils.isEmpty(supersededLogo)) {
+            deleteServerLogoFile(supersededLogo);
+        }
+    }
+
+    /**
+     * True only for files saveFetchedIconStable() wrote, which it names
+     * "&lt;serverId&gt;_&lt;digest&gt;.png".
+     *
+     * Note this deliberately does NOT match saveFetchedIcon's
+     * "fetched_&lt;timestamp&gt;.png": AddServerFragment stores BOTH a manually
+     * picked icon and an auto-fetched one under that name, so they cannot be
+     * told apart, and clearing them could throw away an image the user chose
+     * from their gallery. Consequence: a logo captured when the server was
+     * added is replaced, but not cleared, until one refresh has written a
+     * digest-named file over it.
+     */
+    private static boolean isFetchedServerLogo(String serverId, String logoPath) {
+        if (TextUtils.isEmpty(serverId) || TextUtils.isEmpty(logoPath)) {
+            return false;
+        }
+        try {
+            File dir = new File(ApplicationLoader.applicationContext.getFilesDir(), SERVER_LOGOS_DIR);
+            File file = new File(logoPath);
+            return dir.equals(file.getParentFile())
+                    && file.getName().startsWith(serverId + "_");
+        } catch (Exception e) {
+            FileLog.e(e);
+            return false;
+        }
+    }
+
+    private static JSONObject readBuiltinIdentityRoot() {
+        try {
+            return new JSONObject(getPrefs().getString(KEY_BUILTIN_IDENTITY, "{}"));
+        } catch (Exception e) {
+            return new JSONObject();
+        }
+    }
+
+    private static void writeBuiltinIdentity(
+            String serverId,
+            String name,
+            String description,
+            String logoPath) {
+        try {
+            JSONObject root = readBuiltinIdentityRoot();
+            JSONObject object = new JSONObject();
+            if (!TextUtils.isEmpty(name)) {
+                object.put("name", name);
+            }
+            if (!TextUtils.isEmpty(description)) {
+                object.put("description", description);
+            }
+            if (!TextUtils.isEmpty(logoPath)) {
+                object.put("logoPath", logoPath);
+            }
+            root.put(serverId, object);
+            getPrefs().edit().putString(KEY_BUILTIN_IDENTITY, root.toString()).apply();
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+    }
+
+    // Overlays the stored identity onto a freshly built built-in server.
+    // Empty/missing fields leave the compiled-in defaults in place.
+    static void applyBuiltinIdentity(OwpengramServer s) {
+        JSONObject object = readBuiltinIdentityRoot().optJSONObject(s.id);
+        if (object == null) {
+            return;
+        }
+        String name = object.optString("name", "");
+        String description = object.optString("description", "");
+        String logoPath = object.optString("logoPath", "");
+        if (!TextUtils.isEmpty(name)) {
+            s.name = name;
+        }
+        if (!TextUtils.isEmpty(description)) {
+            s.description = description;
+        }
+        if (!TextUtils.isEmpty(logoPath)) {
+            s.logoPath = logoPath;
+        }
+    }
+
+    /**
+     * Like saveFetchedIcon, but the file name carries a digest of the encoded
+     * bytes instead of a timestamp. Two things depend on that: an unchanged
+     * icon resolves to the same path, so a refresh sees "nothing changed" and
+     * skips the write entirely; and a changed icon lands on a NEW path, which
+     * the previous one's image cache entry cannot be mistaken for -- that is
+     * exactly how a stale logo survives a refresh.
+     */
+    private static String saveFetchedIconStable(String serverId, Bitmap bitmap) {
+        if (bitmap == null) {
+            return null;
+        }
+        try {
+            ByteArrayOutputStream buffer = new ByteArrayOutputStream();
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, buffer);
+            byte[] bytes = buffer.toByteArray();
+            byte[] hash = MessageDigest.getInstance("MD5").digest(bytes);
+            final char[] hex = "0123456789abcdef".toCharArray();
+            StringBuilder digest = new StringBuilder();
+            for (int i = 0; i < 4; i++) {
+                int value = hash[i] & 0xFF;
+                digest.append(hex[value >>> 4]).append(hex[value & 0x0F]);
+            }
+            File dir = new File(ApplicationLoader.applicationContext.getFilesDir(), SERVER_LOGOS_DIR);
+            if (!dir.exists() && !dir.mkdirs()) {
+                FileLog.e("OwpengramServers: failed to create " + dir);
+                return null;
+            }
+            File file = new File(dir, serverId + "_" + digest + ".png");
+            if (!file.exists()) {
+                try (FileOutputStream out = new FileOutputStream(file)) {
+                    out.write(bytes);
+                }
+            }
+            return file.getAbsolutePath();
+        } catch (Exception e) {
+            FileLog.e(e);
+            return null;
+        }
+    }
+
+    // Only ever deletes inside our own logos directory, so a server pointed
+    // at a user-picked image elsewhere on disk is left alone.
+    private static void deleteServerLogoFile(String path) {
+        if (TextUtils.isEmpty(path)) {
+            return;
+        }
+        try {
+            File dir = new File(ApplicationLoader.applicationContext.getFilesDir(), SERVER_LOGOS_DIR);
+            File file = new File(path);
+            if (dir.equals(file.getParentFile()) && file.exists()) {
+                file.delete();
+            }
+        } catch (Exception e) {
+            FileLog.e(e);
+        }
+    }
+}

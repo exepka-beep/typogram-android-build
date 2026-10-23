@@ -1,0 +1,476 @@
+name: Build TypoGram APK
+
+# Собирает подписанный release-APK TypoGram из форка owpengram-android-client.
+#
+# Почему overlay, а не патч
+# -------------------------
+# Кастомизация XTree Gram — это 205 изменённых файлов поверх origin/main, из них
+# 145 — бинарные иконки. Патч на такое дерево хрупок (fuzz, контексты, бинарники),
+# а overlay — это «положить файлы поверх свежего клона». Поэтому в этом
+# репозитории лежат не патчи, а сами файлы (files/), а upstream клонируется на
+# раннере из закреплённого коммита.
+#
+# Почему сборка идёт в Docker
+# ---------------------------
+# Android SDK + NDK 27 — это ~10 ГБ и полчаса установки. В репозитории уже есть
+# Dockerfile, которым собирался XTree Gram, и он же ставит SDK, NDK и cmake.
+# Используем его как есть: образ переиспользуется, а набор версий инструментов
+# остаётся тем же, что и у проверенной сборки XTree Gram.
+#
+# Платежи
+# -------
+# Отключены в overlay (PaymentFormActivity: `XTREE_PAYMENTS_DISABLED = true` и
+# ранний `return false` из onFragmentCreate). Шаг "Verify payments are disabled"
+# падает, если эта правка пропала из дерева.
+
+on:
+  # Только вручную: один прогон — это 40–70 минут раннера, он не должен
+  # запускаться сам от пуша.
+  workflow_dispatch:
+    inputs:
+      gradle_tasks:
+        description: 'Gradle-задачи через пробел'
+        required: false
+        type: string
+        default: ':TMessagesProj_App:assembleAfatRelease'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    env:
+      # Закреплённый коммит форка. Overlay собран ровно под него: смена ref
+      # означает, что файлы overlay надо перепроверить.
+      UPSTREAM_REPO: https://github.com/owpengram/owpengram-android-client.git
+      UPSTREAM_REF: 4adc49b29dcfe8117cfd804131e403021df7c09a
+
+      # Приватный клон (кэшируется) и рабочая копия, в которую накладывается
+      # overlay. Разделены намеренно: кэш обязан оставаться чистым, иначе
+      # ребрендинг предыдущего прогона переживёт следующий.
+      #
+      # Сами пути задаются первым шагом через $GITHUB_ENV, а не здесь: контекст
+      # `runner` в env на уровне job недоступен, и workflow с ним не разбирается
+      # вовсе (`Unrecognized named-value: 'runner'` на этапе dispatch).
+
+      # Наш сервер.
+      #
+      # 🔴 Здесь ДОМЕН, и это работает только потому, что в overlay лежит
+      # пропатченный ConnectionSocket.cpp: при провале inet_pton он резолвит имя
+      # через gethostbyname (ровно как это уже делала ветка прокси). Без патча
+      # клиент закрывал сокет и показывал вечную загрузку — так провалилась
+      # сборка ShapitoGram #5, где в DEFAULT_HOST стоял домен.
+      APP_SERVER_HOST: typogram.duckdns.org
+      APP_SERVER_PORT: "2398"
+      SERVER_DOMAIN: typogram.duckdns.org
+      # На новом VPS HTTP-эндпоинта server-info нет, поэтому ключ не скачивается,
+      # а лежит в репозитории: config/server-rsa-public.pem (публичный ключ —
+      # не секрет). Формат PKCS#1: нативный парсер — PEM_read_bio_RSAPublicKey,
+      # он понимает только "BEGIN RSA PUBLIC KEY" и SPKI не принимает.
+      SERVER_INFO_URL: "https://typogram.duckdns.org/owpengram/server-info"
+
+      # Версия. Совпадает с XTree Gram намеренно: это тот же код, и различать
+      # сборки по номеру версии смысла нет — их различает applicationId.
+      APP_VERSION_CODE: "7042"
+      APP_VERSION_NAME: "12.10.1"
+      APP_PACKAGE: com.typogram.messenger
+      APP_LABEL: TypoGram
+      # versionCode afat = APP_VERSION_CODE * 10 + 9 (см. TMessagesProj_App/build.gradle).
+      EXPECTED_VERSION_CODE: "70429"
+
+      # Отпечаток сертификата ключа подписи. Если APK подписан не им,
+      # обновление поверх установленного приложения не встанет — лучше упасть здесь.
+      EXPECTED_CERT_SHA256: "4A:AB:1A:40:0F:1E:AB:E5:4D:B1:AB:B1:41:BD:9F:C0:7D:68:1F:EC:54:71:5E:1B:1D:D5:16:B1:8F:DE:F3:6B"
+
+      DOCKER_IMAGE: typogram-android-builder
+      GRADLE_TASKS: ${{ inputs.gradle_tasks || ':TMessagesProj_App:assembleAfatRelease' }}
+
+    steps:
+      - name: Checkout this repository
+        uses: actions/checkout@v4
+
+      - name: Set up paths
+        run: |
+          set -euxo pipefail
+          # Три каталога на раннере, а не в репозитории. Пишем их в $GITHUB_ENV,
+          # потому что ${{ runner.temp }} в env на уровне job GitHub не принимает.
+          echo "SOURCE_DIR=$RUNNER_TEMP/src" >> "$GITHUB_ENV"
+          echo "BUILD_DIR=$RUNNER_TEMP/build" >> "$GITHUB_ENV"
+          echo "GRADLE_HOME=$RUNNER_TEMP/gradle-home" >> "$GITHUB_ENV"
+          echo "раннер: $(nproc) ядер, $(free -g | awk '/^Mem:/{print $2}') ГБ RAM"
+          df -h / | tail -1
+
+      - name: Free disk space
+        run: |
+          set -euxo pipefail
+          # Сколько места нужно: образ ~10 ГБ + gradle и NDK ещё ~10 ГБ.
+          #
+          # Шаг условный, и это не перестраховка в обе стороны. На нынешнем
+          # ubuntu-latest под `/` 145 ГБ, из них 86 ГБ свободны сразу — удаление
+          # 12 ГБ предустановленного Android SDK ничего не решает, но стоит
+          # ~6 минут: это 700 тысяч мелких файлов, и `rm -rf` по ним идёт дольше
+          # самой сборки на этом этапе. При этом раннеры бывают и теснее, поэтому
+          # при нехватке места чистка всё-таки выполняется.
+          AVAIL_GB=$(( $(df --output=avail -k / | tail -1) / 1024 / 1024 ))
+          echo "свободно на /: ${AVAIL_GB} ГБ"
+          df -h /
+          if (( AVAIL_GB >= 40 )); then
+            echo "места достаточно — ничего не удаляю"
+            exit 0
+          fi
+          echo "меньше 40 ГБ — освобождаю"
+          # Из предустановленного здесь не нужно почти ничего: свой Android SDK
+          # мы ставим внутрь образа, Java и Android-инструменты не используются.
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf /opt/ghc /usr/local/.ghcup || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo apt-get clean
+          echo "--- после ---"
+          df -h /
+
+      - name: Restore the source tree cache
+        uses: actions/cache@v4
+        with:
+          # Здесь ${{ runner.temp }} допустим: контекст `runner` доступен в `with`
+          # шага, в отличие от env на уровне job.
+          path: ${{ runner.temp }}/src
+          # Ключ по ref, а не по github.sha: каждый прогон клонирует один и тот
+          # же коммит, поэтому пер-коммитный ключ не восстановился бы никогда.
+          key: android-src-${{ runner.os }}-${{ env.UPSTREAM_REF }}-v1
+          restore-keys: |
+            android-src-${{ runner.os }}-${{ env.UPSTREAM_REF }}-
+
+      - name: Restore the Gradle cache
+        uses: actions/cache@v4
+        with:
+          # Раннер каждый раз новый, поэтому GRADLE_USER_HOME без кэша живёт
+          # ровно один прогон. Кэшируем: зависимости Telegram Android — это
+          # ~1 ГБ загрузок, которые иначе качаются заново на каждой сборке.
+          path: ${{ runner.temp }}/gradle-home
+          key: android-gradle-${{ runner.os }}-${{ env.UPSTREAM_REF }}-v1
+          restore-keys: |
+            android-gradle-${{ runner.os }}-${{ env.UPSTREAM_REF }}-
+            android-gradle-${{ runner.os }}-
+
+      - name: Clone upstream
+        run: |
+          set -euxo pipefail
+          if [[ -d "$SOURCE_DIR/.git" ]]; then
+            echo "кэш на месте — клон не нужен"
+          else
+            mkdir -p "$SOURCE_DIR"
+            git -C "$SOURCE_DIR" init -q
+            git -C "$SOURCE_DIR" remote add origin "$UPSTREAM_REPO"
+            # --depth 1 по конкретному SHA: тянем ровно один коммит, а не 281 МБ истории.
+            git -C "$SOURCE_DIR" fetch --depth 1 origin "$UPSTREAM_REF"
+            git -C "$SOURCE_DIR" checkout -q --detach FETCH_HEAD
+          fi
+          actual="$(git -C "$SOURCE_DIR" rev-parse HEAD)"
+          echo "HEAD=$actual"
+          [[ "$actual" == "$UPSTREAM_REF" ]] || {
+            echo "ожидали $UPSTREAM_REF — overlay собран под него" >&2
+            exit 1
+          }
+
+      - name: Update submodules
+        run: |
+          set -euxo pipefail
+          # Без ffmpeg/libvpx/dav1d/opus/openh264 нативная часть (tmessages.49) не
+          # соберётся. --depth 1 работает не для всех сабмодулей: их зафиксированные
+          # коммиты не всегда вершины веток, и тогда сервер отказывается отдавать
+          # объект по SHA. Поэтому сначала пробуем мелко, потом честно глубоко.
+          git -C "$SOURCE_DIR" submodule sync --recursive
+          if ! git -C "$SOURCE_DIR" submodule update --init --recursive --depth 1 --jobs 8; then
+            echo "мелкий клон сабмодулей не прошёл — клонирую полностью"
+            git -C "$SOURCE_DIR" submodule update --init --recursive --jobs 8
+          fi
+          git -C "$SOURCE_DIR" submodule status --recursive | wc -l
+
+      - name: Copy the source and apply the TypoGram overlay
+        run: |
+          set -euxo pipefail
+          rm -rf "$BUILD_DIR"
+          # cp -a, а не mv: кэш обязан остаться нетронутым.
+          cp -a "$SOURCE_DIR" "$BUILD_DIR"
+          overlay_count="$(cd "$GITHUB_WORKSPACE/files" && find . -type f | wc -l)"
+          cp -a "$GITHUB_WORKSPACE/files/." "$BUILD_DIR/"
+          echo "наложено файлов overlay: $overlay_count"
+          # Контроль: overlay обязан был лечь поверх клона, а не рядом.
+          test -f "$BUILD_DIR/TMessagesProj/src/main/java/org/telegram/owpengram/OwpengramServers.java"
+
+      - name: Verify payments are disabled
+        run: |
+          set -euxo pipefail
+          # Проверяем именно дерево, которое уйдёт в сборку. Это единственная
+          # проверка платежей, которая не зависит от R8: в готовом APK имя
+          # XTREE_PAYMENTS_DISABLED может быть переименовано минификатором.
+          PAY="$BUILD_DIR/TMessagesProj/src/main/java/org/telegram/ui/PaymentFormActivity.java"
+          test -f "$PAY" || { echo "нет PaymentFormActivity.java" >&2; exit 1; }
+          grep -q 'XTREE_PAYMENTS_DISABLED = true' "$PAY" || {
+            echo "FAIL: платежи НЕ отключены — в PaymentFormActivity.java нет" >&2
+            echo "      'XTREE_PAYMENTS_DISABLED = true'. Overlay не наложился?" >&2
+            exit 1
+          }
+          grep -q 'if (XTREE_PAYMENTS_DISABLED)' "$PAY" || {
+            echo "FAIL: флаг платежей есть, но onFragmentCreate его не проверяет" >&2
+            exit 1
+          }
+          grep -n 'XTREE_PAYMENTS_DISABLED' "$PAY"
+
+      - name: Install the TypoGram server RSA public key
+        run: |
+          set -euxo pipefail
+          # Ключ лежит в репозитории, а не скачивается: на новом VPS нет
+          # HTTP-эндпоинта /owpengram/server-info. Публичный ключ секретом не
+          # является, поэтому хранить его в репозитории можно и нужно — сборка
+          # становится воспроизводимой и не зависит от доступности сервера.
+          #
+          # Формат обязан быть PKCS#1 ("BEGIN RSA PUBLIC KEY"): нативный слой
+          # разбирает ключ через PEM_read_bio_RSAPublicKey и SPKI не понимает.
+          SRC="$GITHUB_WORKSPACE/config/server-rsa-public.pem"
+          test -s "$SRC" || { echo "нет config/server-rsa-public.pem" >&2; exit 1; }
+          grep -q -- '-----BEGIN RSA PUBLIC KEY-----' "$SRC" || {
+            echo "FAIL: ключ не в формате PKCS#1 (нужен 'BEGIN RSA PUBLIC KEY')" >&2
+            echo "      SPKI ('BEGIN PUBLIC KEY') нативный парсер не примет." >&2
+            exit 1
+          }
+          cp "$SRC" "$RUNNER_TEMP/server-rsa-public.pem"
+          # Отпечаток печатает шаг ребрендинга (rebrand_android.py --rsa-pem):
+          # он должен совпасть с rsa_fingerprint из лога сервера. Здесь только
+          # показываем начало тела ключа, чтобы прогон было с чем сверять.
+          sed -n '2p' "$SRC" | cut -c1-32
+
+      - name: Install the signing keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euxo pipefail
+          if [[ -z "${KEYSTORE_B64:-}" ]]; then
+            echo "нет секрета ANDROID_KEYSTORE_BASE64" >&2
+            echo "Положить его: python tools/set_secrets.py --keystore ../artifacts/release.keystore" >&2
+            exit 1
+          fi
+          # config/ есть в клоне (там манифесты), сам keystore — нет: он в .gitignore.
+          printf '%s' "$KEYSTORE_B64" | base64 -d > "$BUILD_DIR/TMessagesProj/config/release.keystore"
+          test -s "$BUILD_DIR/TMessagesProj/config/release.keystore"
+          ls -l "$BUILD_DIR/TMessagesProj/config/release.keystore"
+
+      - name: Rebrand to TypoGram and point at our server
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euxo pipefail
+          # Адрес — домен. Это допустимо только вместе с пропатченным
+          # ConnectionSocket.cpp из overlay: он резолвит имя через gethostbyname.
+          # Проверяем, что патч на месте, иначе APK соберётся и не подключится.
+          SOCK="$BUILD_DIR/TMessagesProj/jni/tgnet/ConnectionSocket.cpp"
+          grep -q 'TypoGram: встроенный сервер задан доменом' "$SOCK" || {
+            echo "FAIL: в ConnectionSocket.cpp нет патча резолва домена" >&2
+            echo "      overlay не наложился или файл потерялся." >&2
+            exit 1
+          }
+          if [[ "$APP_SERVER_HOST" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+            echo "note: адрес задан IP — резолв не понадобится"
+          elif [[ "$APP_SERVER_HOST" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]]; then
+            echo "адрес задан доменом: $APP_SERVER_HOST (резолв через патч overlay)"
+          else
+            echo "APP_SERVER_HOST='$APP_SERVER_HOST' не похож ни на IPv4, ни на имя хоста" >&2
+            exit 1
+          fi
+          # Один шаг делает всё: имя пакета, строки во всех локалях, следы XTree Gram
+          # в Java, адрес и RSA-ключ сервера, и настройки подписи. В конце он сам
+          # ищет остатки XTree Gram в дереве и падает, если что-то нашлось.
+          python3 scripts/rebrand_android.py "$BUILD_DIR/TMessagesProj" \
+            --host "$APP_SERVER_HOST" \
+            --port "$APP_SERVER_PORT" \
+            --rsa-pem "$RUNNER_TEMP/server-rsa-public.pem" \
+            --version-code "$APP_VERSION_CODE" \
+            --version-name "$APP_VERSION_NAME"
+
+      - name: Set api_id / api_hash
+        env:
+          TELEGRAM_API_ID: ${{ secrets.TELEGRAM_API_ID }}
+          TELEGRAM_API_HASH: ${{ secrets.TELEGRAM_API_HASH }}
+        run: |
+          set -euxo pipefail
+          # Если секретов нет, шаг оставляет учётные данные upstream (они рабочие)
+          # и говорит об этом. Своё приложение можно завести на my.telegram.org.
+          python3 scripts/set_api_credentials.py \
+            "$BUILD_DIR/TMessagesProj/src/main/java/org/telegram/messenger/BuildVars.java"
+
+      - name: Pull the base image
+        run: |
+          set -euxo pipefail
+          # Docker Hub отдаёт анонимным клиентам 429 Too Many Requests, а IP
+          # раннеров GitHub общие: первый прогон упал именно на этом —
+          #   `unexpected status from HEAD request to registry-1.docker.io/v2/
+          #    library/gradle/manifests/8.11.1-jdk17: 429 Too Many Requests`.
+          # Поэтому базовый образ тянем с зеркала.
+          #
+          # public.ecr.aws/docker/library/* — официальное зеркало образов Docker
+          # Hub от AWS, без анонимных лимитов (проверено: манифест отдаёт 200 с
+          # application/vnd.oci.image.index.v1+json). Docker Hub оставлен вторым:
+          # если у него лимит отпустит, он тоже подойдёт.
+          MIRRORS=(
+            "public.ecr.aws/docker/library/gradle:8.11.1-jdk17"
+            "docker.io/library/gradle:8.11.1-jdk17"
+          )
+          BASE_IMAGE=""
+          for candidate in "${MIRRORS[@]}"; do
+            for attempt in 1 2 3; do
+              if docker pull "$candidate"; then BASE_IMAGE="$candidate"; break 2; fi
+              echo "не вышло: $candidate (попытка $attempt)"
+              sleep $((attempt * 15))
+            done
+          done
+          if [[ -z "$BASE_IMAGE" ]]; then
+            echo "не смог скачать базовый образ ни с одного зеркала" >&2
+            exit 1
+          fi
+          echo "базовый образ: $BASE_IMAGE"
+
+          # Dockerfile начинается с `FROM gradle:8.11.1-jdk17` — это имя живёт в
+          # Docker Hub, и docker build пошёл бы ровно туда же, за тем же 429.
+          # Переписываем единственную строку FROM на зеркало, с которого образ
+          # реально скачался: тогда build вообще не обращается к реестру.
+          # Правка минимальная, и она печатается в лог.
+          sed -i "1s|^FROM .*|FROM ${BASE_IMAGE}|" "$BUILD_DIR/Dockerfile"
+          echo "--- первая строка Dockerfile после правки ---"
+          head -1 "$BUILD_DIR/Dockerfile"
+
+      - name: Build the builder image
+        run: |
+          set -euxo pipefail
+          # Dockerfile берём из самого клона: он и есть проверенный набор версий
+          # (gradle 8.11.1, SDK 36, build-tools 36.0.0, NDK 27.2.12479018, cmake 3.22.1).
+          # Слои не кэшируем: образ ~10 ГБ, в лимит кэша GitHub Actions (10 ГБ на
+          # репозиторий) он не влезает вместе с кэшем исходников, а установка SDK
+          # занимает минуты, тогда как сборка — десятки минут.
+          # --pull=false: базовый образ уже локальный (см. шаг выше), в реестр не ходим.
+          docker build --pull=false -t "$DOCKER_IMAGE" -f "$BUILD_DIR/Dockerfile" "$BUILD_DIR"
+          docker image inspect "$DOCKER_IMAGE" --format 'образ: {{.Id}} ({{.Size}} байт)'
+
+      - name: Build the APK
+        run: |
+          set -euxo pipefail
+          mkdir -p "$GRADLE_HOME"
+          # --user root: смонтированные каталоги принадлежат раннеру (uid 1001), а
+          # в образе пользователь gradle (uid 1000) и писать в них не может.
+          # GRADLE_USER_HOME выносим на раннер — так зависимости переживают прогон
+          # (и подхватываются кэшем), а не скачиваются заново каждый раз.
+          docker run --rm \
+            --user root \
+            -v "$BUILD_DIR":/work \
+            -v "$GRADLE_HOME":/gradle-home \
+            -w /work \
+            -e GRADLE_USER_HOME=/gradle-home \
+            -e GRADLE_TASKS="$GRADLE_TASKS" \
+            "$DOCKER_IMAGE" \
+            bash -c 'set -euxo pipefail; cd /work; gradle --no-daemon --parallel $GRADLE_TASKS --stacktrace'
+
+      - name: Locate the APK
+        id: apk
+        run: |
+          set -euxo pipefail
+          APK="$(find "$BUILD_DIR/TMessagesProj_App/build/outputs/apk" -name '*.apk' -type f | head -1)"
+          if [[ -z "$APK" ]]; then
+            echo "APK не найден. Что есть в outputs:" >&2
+            find "$BUILD_DIR/TMessagesProj_App/build/outputs" -maxdepth 4 2>/dev/null >&2 || true
+            exit 1
+          fi
+          echo "APK: $APK"
+          echo "path=$APK" >> "$GITHUB_OUTPUT"
+          echo "name=TypoGram-${{ env.APP_VERSION_NAME }}-build${{ github.run_number }}.apk" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the APK structure and signature
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euxo pipefail
+          # $BUILD_DIR смонтирован в /work, поэтому путь на раннере надо перевести
+          # в контейнерный: /home/runner/work/_temp/build/... -> /work/...
+          # (просто отрезать префикс нельзя — получится /TMessagesProj_App/...).
+          APK_IN_CONTAINER="/work${APK_PATH#$BUILD_DIR}"
+          # Скрипт берём из этого репозитория (смонтирован в /pipeline), а не из
+          # клона: в клоне лежит СВОЙ scripts/ от upstream, и он нам не нужен.
+          # aapt2 и apksigner — внутри образа, из того же SDK, которым собирали.
+          docker run --rm --user root \
+            -v "$BUILD_DIR":/work \
+            -v "$GITHUB_WORKSPACE":/pipeline:ro \
+            "$DOCKER_IMAGE" \
+            bash -c 'bash /pipeline/scripts/verify_apk.sh "$@"' _ \
+              "$APK_IN_CONTAINER" "$APP_PACKAGE" "$EXPECTED_VERSION_CODE" "$APP_VERSION_NAME" "$EXPECTED_CERT_SHA256"
+
+      - name: Scan the APK for XTree Gram leftovers
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+        run: |
+          set -euxo pipefail
+          # На раннере, а не в образе: здесь есть python3, а разбор зипа не требует
+          # Android SDK. Ключ сервера передаём как обязательную подстроку — так
+          # проверяется, что в APK попал именно НАШ ключ, а не ключ XTree Gram.
+          # Вторая строка PEM — первая строка base64-тела.
+          #
+          # APP_SERVER_HOST здесь домен, и он в APK попадает: это строковая
+          # константа DEFAULT_HOST в OwpengramServers.java. Раньше сюда передавали
+          # IP именно потому, что домен в бинарь не вшивался.
+          KEY_BODY="$(sed -n '2p' "$RUNNER_TEMP/server-rsa-public.pem")"
+          echo "ищу адрес сервера: $APP_SERVER_HOST"
+          echo "ищу ключ сервера: ${KEY_BODY:0:24}..."
+          python3 tools/scan_apk.py "$APK_PATH" \
+            --present "$APP_SERVER_HOST" \
+            --present "$APP_PACKAGE" \
+            --present "$KEY_BODY" \
+            --absent ShapitoGram \
+            --absent shapitogram \
+            --absent 94.156.170.106 \
+            --json "$RUNNER_TEMP/apk-branding-report.json"
+
+      - name: Collect artifacts
+        # `always()`: APK — это результат сборки, а проверки выше — диагностика.
+        # Ошибка в проверке (как в прогоне #4, где путь внутри контейнера был без
+        # /work) не должна уничтожать сорок минут работы. Прогон всё равно
+        # красный, поэтому спутать проверенный APK с непроверенным нельзя.
+        if: always()
+        env:
+          APK_PATH: ${{ steps.apk.outputs.path }}
+          APK_NAME: ${{ steps.apk.outputs.name }}
+        run: |
+          set -euxo pipefail
+          OUT="$RUNNER_TEMP/artifacts"
+          mkdir -p "$OUT"
+          if [[ -z "$APK_PATH" || ! -f "$APK_PATH" ]]; then
+            echo "APK не найден — собирать нечего" >&2
+            exit 1
+          fi
+          cp "$APK_PATH" "$OUT/$APK_NAME"
+          # Отчёт сканера есть, только если сам сканер дошёл до конца.
+          if [[ -f "$RUNNER_TEMP/apk-branding-report.json" ]]; then
+            cp "$RUNNER_TEMP/apk-branding-report.json" "$OUT/"
+          else
+            echo "note: отчёта сканера нет — проверка содержимого не дошла до конца" >&2
+          fi
+          # mapping.txt — имена классов и методов после R8. Без него стектрейс из
+          # релизной сборки не читается вообще: все классы называются a.b.c.
+          # Best effort: его отсутствие не должно валить прогон, APK уже готов.
+          MAPPING="$(find "$BUILD_DIR/TMessagesProj_App/build/outputs/mapping" -name 'mapping.txt' 2>/dev/null | head -1)"
+          if [[ -n "$MAPPING" ]]; then
+            cp "$MAPPING" "$OUT/mapping.txt"
+            echo "mapping.txt: $(du -h "$OUT/mapping.txt" | cut -f1)"
+          else
+            echo "note: mapping.txt не найден — стектрейсы будут нечитаемы" >&2
+          fi
+          ls -la "$OUT"
+          sha256sum "$OUT"/*.apk | tee "$OUT/SHA256SUMS.txt"
+
+      - name: Upload the APK
+        # Тоже `always()` — по той же причине: результат нужен даже при красной
+        # проверке, иначе отлаживать нечего.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: TypoGram-APK-${{ env.APP_VERSION_NAME }}-build${{ github.run_number }}
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: error
