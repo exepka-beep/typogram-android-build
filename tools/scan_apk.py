@@ -34,11 +34,15 @@ APK — это zip, содержимое не сжато «в никуда»: с
 найден. Отсутствие — это тоже ошибка: если в APK нет IP нашего сервера, значит
 туда не попал наш адрес, и клиент никуда не подключится.
 
-Про адрес: проверять надо именно **IP**, а не домен. В `DEFAULT_HOST` уходит
-`APP_SERVER_HOST`, а он обязан быть числовым IPv4 — нативный слой Android зовёт
-`inet_pton` и имён не понимает. Домен в APK не вшивается вообще (он нужен
-только на этапе сборки, для `SERVER_INFO_URL`), поэтому `--present` с доменом
-падал бы всегда.
+Про адрес: проверяется `APP_SERVER_HOST` — у TypoGram это домен
+`typogram.duckdns.org`, и он действительно попадает в APK строковой константой
+`DEFAULT_HOST` в `OwpengramServers.java`. Числовой IP тут не нужен: нативный
+слой резолвит имя через `gethostbyname` (см. патч `ConnectionSocket.cpp` в
+overlay), поэтому домен работает и в `DEFAULT_HOST`.
+
+Метаданные подписи (`META-INF/*.RSA` и прочие) исключены из проверок
+`--absent`: в них лежит subject сертификата, а он общий с ShapitoGram, потому
+что keystore переиспользуется.
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import pathlib
+import re
 import sys
 import zipfile
 
@@ -60,14 +65,23 @@ DEFAULT_ABSENT = (
     "xtreegramkey",
 )
 
+# Метаданные подписи. В них лежит subject сертификата, а он у нас исторически
+# `CN=ShapitoGram`: TypoGram подписывается тем же keystore, чтобы APK обоих
+# проектов имели один отпечаток и обновлялись поверх друг друга. Это не брендинг
+# приложения — пользователь этих строк нигде не видит, — поэтому проверки
+# `--absent` их не смотрят. Содержимое кода и ресурсов проверяется как обычно.
+SIGNATURE_FILES = re.compile(r"^META-INF/[^/]+\.(RSA|DSA|EC|SF|MF)$", re.IGNORECASE)
+
 
 def scan(path: pathlib.Path, markers, present):
     """{marker: [(имя файла в архиве, кодировка, смещение)]}"""
     found = {m: [] for m in list(markers) + list(present)}
+    absent = set(markers)
     with zipfile.ZipFile(path) as zf:
         for info in zf.infolist():
             if info.is_dir():
                 continue
+            signature_metadata = bool(SIGNATURE_FILES.match(info.filename))
             try:
                 raw = zf.read(info)
             except (zipfile.BadZipFile, RuntimeError, OSError):
@@ -75,6 +89,8 @@ def scan(path: pathlib.Path, markers, present):
             for marker in found:
                 if found[marker]:
                     # Достаточно одного места: цель проверки — факт, а не список.
+                    continue
+                if signature_metadata and marker in absent:
                     continue
                 for encoding in ("utf-8", "utf-16le"):
                     needle = marker.encode(encoding)
